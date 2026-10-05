@@ -6,7 +6,6 @@ import numpy as np
 import plotly.graph_objects as go
 import requests
 from groq import Groq
-from datetime import datetime
 
 # ==========================================
 # إعدادات الصفحة
@@ -21,7 +20,6 @@ GROQ_API_KEY = "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"
 ACCOUNT_BALANCE = 1000
 RISK_PERCENT = 1.0
 
-# تهيئة الذاكرة للصفقات
 if 'trades' not in st.session_state:
     st.session_state.trades = []
 
@@ -53,13 +51,16 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             df = yf.download(yf_symbol, interval=timeframe, period=period, progress=False)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
+            # 🛠️ إصلاح الوقت: إزالة المنطقة الزمنية ليعمل Plotly بشكل صحيح
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
             return df
         except:
             return pd.DataFrame()
     return df
 
 # ==========================================
-# 2. تحليل SMC (كشف المناطق)
+# 2. تحليل SMC
 # ==========================================
 def detect_zones(df, lookback=10):
     df = df.copy()
@@ -149,7 +150,7 @@ def send_tg(msg):
     except: return False
 
 # ==========================================
-# 4. نظام مراقبة الصفقات (Trade Monitoring)
+# 4. مراقبة الصفقات
 # ==========================================
 def update_trades(current_price):
     updated_trades = []
@@ -161,7 +162,7 @@ def update_trades(current_price):
                 elif current_price <= trade['sl'] and trade['sl_moved'] == False:
                     trade['status'] = 'Closed (SL Hit)'; trade['pnl'] = 'Loss'
                 elif current_price >= trade['tp1'] and trade['sl_moved'] == False:
-                    trade['sl'] = trade['entry'] # نقل SL للتعادل
+                    trade['sl'] = trade['entry']
                     trade['sl_moved'] = True
                     trade['status'] = 'Active (TP1 Hit - Break Even)'
             elif trade['type'] == 'SELL':
@@ -177,9 +178,10 @@ def update_trades(current_price):
     st.session_state.trades = updated_trades
 
 # ==========================================
-# 5. رسم شارت Plotly (مضمون 100% ويدعم اللمس)
+# 5. رسم الشارت (نسخة نهائية تسمح بالتكبير والتحريك)
 # ==========================================
 def render_plotly_chart(df, zones, symbol, timeframe):
+    # إنشاء الشموع
     fig = go.Figure(data=[go.Candlestick(
         x=df.index,
         open=df['open'], high=df['high'],
@@ -191,6 +193,7 @@ def render_plotly_chart(df, zones, symbol, timeframe):
         decreasing_fillcolor='#ef5350'
     )])
     
+    # رسم المناطق
     for z in zones:
         color = '#26a69a' if z['type'] == 'BUY' else '#ef5350'
         label = "ZONE ACHAT" if z['type'] == 'BUY' else "ZONE VENTE"
@@ -208,34 +211,60 @@ def render_plotly_chart(df, zones, symbol, timeframe):
             fig.add_hline(y=z['tp1'], line_dash="dot", line_color="#00E676", annotation_text="TP1")
             fig.add_hline(y=z['tp2'], line_dash="dot", line_color="#00C853", annotation_text="TP2")
 
+    # 🛠️ إعدادات الشارت ليكون تفاعلياً بالكامل
     fig.update_layout(
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
-        height=500,
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="", tickformat="%H:%M"),
-        yaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="Prix", side="right"),
+        height=600, # زيادة الارتفاع
+        margin=dict(l=5, r=5, t=30, b=5),
+        xaxis=dict(
+            showgrid=True, 
+            gridcolor='rgba(42, 46, 57, 0.5)', 
+            title="", 
+            tickformat="%H:%M", # تنسيق الوقت
+            type='date'
+        ),
+        yaxis=dict(
+            showgrid=True, 
+            gridcolor='rgba(42, 46, 57, 0.5)', 
+            title="", 
+            side="right",
+            autorange=True
+        ),
         plot_bgcolor='#131722',
         paper_bgcolor='#131722',
         hovermode='x unified',
-        dragmode='pan' # تفعيل السحب باللمس
+        dragmode='pan', # السماح بالسحب
+        autosize=True
     )
-    # config يسمح بالتكبير باللمس (Pinch Zoom)
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'scrollZoom': True})
+    
+    # 🛠️ config يتيح التكبير باللمس (Pinch Zoom) وإظهار الأدوات
+    st.plotly_chart(fig, use_container_width=True, config={
+        'scrollZoom': True, 
+        'displayModeBar': True, 
+        'displaylogo': False,
+        'modeBarButtonsToRemove': ['lasso2d', 'select2d']
+    })
 
 # ==========================================
-# 6. واجهة المستخدم الرئيسية
+# 6. واجهة المستخدم
 # ==========================================
-st.title("📊 AI SMC Trader - Pro")
+st.title("📊 AI SMC Trader")
 
 with st.sidebar:
     st.header("⚙️ اختيار السوق")
     symbol_choice = st.selectbox("اختر الأصل", ["BTC-USD", "ETH-USD", "GC=F (Or)", "EURUSD=X", "GBPUSD=X", "^GSPC (S&P500)"])
     symbol = symbol_choice.split(" ")[0]
     timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h", "1d"])
+    
     st.divider()
     st.caption(f"💰 رأس المال: ${ACCOUNT_BALANCE} | المخاطرة: {RISK_PERCENT}%")
-    if st.button("🗑️ مسح سجل الصفقات"):
+    
+    # 🛠️ زر تحديث يدوي بدلاً من التحديث التلقائي
+    if st.button("🔄 تحديث البيانات", use_container_width=True):
+        st.rerun()
+        
+    if st.button("🗑️ مسح سجل الصفقات", use_container_width=True):
         st.session_state.trades = []
         st.rerun()
 
@@ -263,10 +292,7 @@ try:
     col4.metric("الحالة", "🟢 مباشر")
     
     df, active_zones = detect_zones(df_ltf)
-    
-    # تحديث الصفقات بناءً على السعر الحالي
     update_trades(current_price)
-    
     render_plotly_chart(df, active_zones, symbol, timeframe)
     
     touched_zones = [z for z in active_zones if z['status'] == 'Touched']
@@ -274,46 +300,32 @@ try:
     
     st.divider()
     
-    # عرض الصفقات النشطة (Trade Monitoring)
     if st.session_state.trades:
-        st.subheader("📋 مراقبة الصفقات النشطة")
+        st.subheader("📋 مراقبة الصفقات")
         for t in st.session_state.trades:
             status_color = "🟢" if "TP" in t['status'] or "Break" in t['status'] else ("🔴" if "SL" in t['status'] else "🔵")
-            st.markdown(f"{status_color} **{t['type']}** | الدخول: {t['entry']:.4f} | SL الحالي: {t['sl']:.4f} | الحالة: {t['status']}")
-            if t.get('sl_moved'):
-                st.caption("🛡️ تم نقل وقف الخسارة إلى نقطة التعادل (Break-even)")
+            st.markdown(f"{status_color} **{t['type']}** | الدخول: {t['entry']:.4f} | SL: {t['sl']:.4f} | الحالة: {t['status']}")
     
     if touched_zones:
-        st.subheader("🚨 إشارات جديدة (تم لمس المنطقة)")
+        st.subheader("🚨 إشارات جديدة")
         for z in touched_zones:
-            # منع التكرار في السجل
             already_exists = any(t['time'] == z['time'] and t['type'] == z['type'] for t in st.session_state.trades)
             if not already_exists:
-                new_trade = {
+                st.session_state.trades.append({
                     'type': z['type'], 'time': z['time'], 'entry': z['entry'],
                     'sl': z['sl'], 'tp1': z['tp1'], 'tp2': z['tp2'],
                     'status': 'Active', 'pnl': '', 'sl_moved': False
-                }
-                st.session_state.trades.append(new_trade)
+                })
             
             with st.container():
                 if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
                 else: st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
-                
                 col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("💰 الدخول", f"{z['entry']:.4f}")
                 col2.metric("🛑 SL", f"{z['sl']:.4f}")
                 col3.metric("🎯 TP1", f"{z['tp1']:.4f}")
                 col4.metric("🎯 TP2", f"{z['tp2']:.4f}")
                 col5.metric("📊 اللوت", calc_lot(z['entry'], z['sl'], symbol))
-                
-                if st.button(f"🤖 استشارة AI", key=f"ai_{z['type']}_{z['time']}"):
-                    with st.spinner("..."):
-                        decision = ask_ai(z, trend)
-                        st.info(f"🧠 {decision}")
-                        if "نعم" in decision:
-                            msg = f"🚨 إشارة {z['type']} على {symbol}\nدخول: {z['entry']:.4f}\nSL: {z['sl']:.4f}\nTP1: {z['tp1']:.4f}"
-                            if send_tg(msg): st.success("✅ تم إرسال التنبيه!")
     
     if waiting_zones:
         st.subheader("⏳ مناطق في الانتظار")
