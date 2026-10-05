@@ -3,9 +3,9 @@ import yfinance as yf
 import ccxt
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import requests
 from groq import Groq
+from streamlit_lightweight_charts import renderLightweightCharts
 from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
@@ -18,15 +18,14 @@ TELEGRAM_TOKEN = "8959270070:AAGc1IxMWlc32bzBHoMX_7KcBRiJSsL0nxA"
 TELEGRAM_CHAT_ID = "8619074139"
 GROQ_API_KEY = "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"
 
-# إعدادات إدارة المخاطر
 ACCOUNT_BALANCE = 1000
 RISK_PERCENT = 1.0
 
-# تحديث تلقائي كل 30 ثانية
-st_autorefresh(interval=30000, key="auto_refresh")
+# تحديث تلقائي كل 60 ثانية
+st_autorefresh(interval=60000, key="auto_refresh")
 
 # ==========================================
-# 1. محرك جلب البيانات
+# 1. جلب البيانات
 # ==========================================
 def fetch_data(symbol, timeframe='15m', limit=300):
     crypto_keywords = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE']
@@ -41,7 +40,7 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             df['time'] = pd.to_datetime(df['time'], unit='ms')
             df.set_index('time', inplace=True)
             return df
-        except Exception as e:
+        except:
             symbol = symbol.replace('/', '-').replace('USDT', 'USD')
             is_crypto = False
             
@@ -54,12 +53,12 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
             return df
-        except Exception as e:
+        except:
             return pd.DataFrame()
     return df
 
 # ==========================================
-# 2. محرك تحليل SMC
+# 2. تحليل SMC
 # ==========================================
 def detect_zones(df, lookback=10):
     df = df.copy()
@@ -149,72 +148,123 @@ def send_tg(msg):
     except: return False
 
 # ==========================================
-# 4. رسم شارت Plotly (مضمون 100%)
+# 4. رسم شارت TradingView (مصحح بالكامل)
 # ==========================================
-def render_plotly_chart(df, zones, symbol, timeframe):
-    fig = go.Figure(data=[go.Candlestick(
-        x=df.index,
-        open=df['open'], high=df['high'],
-        low=df['low'], close=df['close'],
-        name='Price',
-        increasing_line_color='#26a69a', # أخضر TradingView
-        decreasing_line_color='#ef5350', # أحمر TradingView
-        increasing_fillcolor='#26a69a',
-        decreasing_fillcolor='#ef5350'
-    )])
+def render_tv_chart(df, zones, symbol, timeframe):
+    df_chart = df.reset_index()
+    df_chart.rename(columns={df_chart.columns[0]: 'time'}, inplace=True)
     
+    # 🛠️ تحويل الوقت إلى Unix timestamp بالثواني (إصلاح جذري)
+    df_chart['time'] = pd.to_datetime(df_chart['time'])
+    df_chart['time'] = df_chart['time'].astype('int64') // 10**9
+    
+    # 🛠️ تنظيف البيانات من التكرار والقيم الفارغة
+    df_chart = df_chart.dropna(subset=['time', 'open', 'high', 'low', 'close'])
+    df_chart = df_chart.drop_duplicates(subset=['time'], keep='last')
+    df_chart = df_chart.sort_values('time').reset_index(drop=True)
+    
+    for col in ['open', 'high', 'low', 'close']:
+        df_chart[col] = pd.to_numeric(df_chart[col], errors='coerce')
+    df_chart = df_chart.dropna()
+    
+    candles = df_chart[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+    
+    # بناء خطوط المناطق والصفقات
+    price_lines = []
     for z in zones:
         if z['type'] == 'BUY':
-            fillcolor = 'rgba(38, 166, 154, 0.15)'
-            line_color = '#26a69a'
-            label = "ZONE ACHAT 🟢"
+            top_color = '#26a69a'
+            label = "ZONE ACHAT"
         else:
-            fillcolor = 'rgba(239, 83, 80, 0.15)'
-            line_color = '#ef5350'
-            label = "ZONE VENTE 🔴"
+            top_color = '#ef5350'
+            label = "ZONE VENTE"
         
-        # رسم المربع (المنطقة)
-        fig.add_shape(type="rect", x0=z['time'], y0=z['bottom'], x1=df.index[-1], y1=z['top'],
-                      fillcolor=fillcolor, line=dict(color=line_color, width=2, dash="dot"), layer="below")
+        price_lines.append({"price": z['top'], "color": top_color, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": label})
+        price_lines.append({"price": z['bottom'], "color": top_color, "lineWidth": 1, "lineStyle": 2, "axisLabelVisible": False})
         
-        # إضافة اسم المنطقة على اليمين
-        fig.add_annotation(x=df.index[-1], y=z['top'], text=label, showarrow=False, 
-                           xanchor='right', yshift=15, font=dict(color=line_color, size=12))
-        
-        # خطوط الصفقة
         if z['status'] == 'Touched':
-            fig.add_hline(y=z['entry'], line_dash="solid", line_color="#2962FF", annotation_text="Entry", annotation_position="right")
-            fig.add_hline(y=z['sl'], line_dash="dash", line_color="#FF1744", annotation_text="SL", annotation_position="right")
-            fig.add_hline(y=z['tp1'], line_dash="dot", line_color="#00E676", annotation_text="TP1", annotation_position="right")
-            fig.add_hline(y=z['tp2'], line_dash="dot", line_color="#00C853", annotation_text="TP2", annotation_position="right")
+            price_lines.append({"price": z['entry'], "color": '#2962FF', "lineWidth": 2, "lineStyle": 0, "axisLabelVisible": True, "title": "ENTRY"})
+            price_lines.append({"price": z['sl'], "color": '#FF1744', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "SL"})
+            price_lines.append({"price": z['tp1'], "color": '#00E676', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP1"})
+            price_lines.append({"price": z['tp2'], "color": '#00C853', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP2"})
 
-    fig.update_layout(
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False, # إزالة شريط التمرير السفلي المزعج
-        height=500,
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="", tickformat="%H:%M"),
-        yaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="Prix", side="right"),
-        plot_bgcolor='#131722',
-        paper_bgcolor='#131722',
-        hovermode='x unified',
-        dragmode='pan'
-    )
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    chartOptions = {
+        "height": 500,
+        "layout": {
+            "background": {"type": 'solid', "color": '#131722'},
+            "textColor": '#D9D9D9',
+            "fontSize": 11,
+        },
+        "grid": {
+            "vertLines": {"color": 'rgba(42, 46, 57, 0.5)', "style": 0},
+            "horzLines": {"color": 'rgba(42, 46, 57, 0.5)', "style": 0},
+        },
+        "crosshair": {
+            "mode": 1,
+            "vertLine": {"color": '#758696', "width": 1, "style": 2, "labelBackgroundColor": '#2962FF'},
+            "horzLine": {"color": '#758696', "width": 1, "style": 2, "labelBackgroundColor": '#2962FF'},
+        },
+        "rightPriceScale": {
+            "borderColor": '#2B2B43',
+            "scaleMargins": {"top": 0.1, "bottom": 0.1},
+        },
+        "timeScale": {
+            "timeVisible": True,
+            "secondsVisible": False,
+            "borderColor": '#2B2B43',
+            "rightOffset": 5,
+            "barSpacing": 8,
+            "minBarSpacing": 0.5,
+        },
+        "handleScroll": {
+            "mouseWheel": True,
+            "pressedMouseMove": True,
+            "horzTouchDrag": True,
+            "vertTouchDrag": True,
+        },
+        "handleScale": {
+            "axisPressedMouseMove": True,
+            "mouseWheel": True,
+            "pinch": True,
+        },
+        "kineticScroll": {
+            "touch": True,
+            "mouse": False,
+        },
+    }
+    
+    seriesCandlestick = [{
+        "type": 'Candlestick',
+        "data": candles,
+        "options": {
+            "upColor": '#26a69a',
+            "downColor": '#ef5350',
+            "borderVisible": False,
+            "wickUpColor": '#26a69a',
+            "wickDownColor": '#ef5350',
+            "priceLineVisible": True,
+            "priceLineColor": '#787B86',
+            "priceLineWidth": 1,
+            "lastValueVisible": True,
+        },
+        "priceLines": price_lines
+    }]
+    
+    renderLightweightCharts([{"chart": chartOptions, "series": seriesCandlestick}], f'tv_chart_{symbol}_{timeframe}')
 
 # ==========================================
 # 5. واجهة المستخدم
 # ==========================================
-st.title("📊 AI SMC Trader - Live Chart")
+st.title("📊 AI SMC Trader")
 
 with st.sidebar:
     st.header("⚙️ اختيار السوق")
     symbol_choice = st.selectbox("اختر الأصل", ["BTC-USD", "ETH-USD", "GC=F (Or)", "EURUSD=X", "GBPUSD=X", "^GSPC (S&P500)"])
     symbol = symbol_choice.split(" ")[0]
-    timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h"])
+    timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h", "1d"])
     st.divider()
     st.caption(f"💰 رأس المال: ${ACCOUNT_BALANCE} | المخاطرة: {RISK_PERCENT}%")
-    st.caption("🔄 التحديث التلقائي: كل 30 ثانية")
+    st.caption("🔄 تحديث كل 60 ثانية")
 
 try:
     df_ltf = fetch_data(symbol, timeframe)
@@ -240,7 +290,7 @@ try:
     col4.metric("الحالة", "🟢 مباشر")
     
     df, active_zones = detect_zones(df_ltf)
-    render_plotly_chart(df, active_zones, symbol, timeframe)
+    render_tv_chart(df, active_zones, symbol, timeframe)
     
     touched_zones = [z for z in active_zones if z['status'] == 'Touched']
     waiting_zones = [z for z in active_zones if z['status'] == 'Waiting']
@@ -248,11 +298,11 @@ try:
     st.divider()
     
     if touched_zones:
-        st.subheader("🚨 إشارات نشطة (تم لمس المنطقة)")
+        st.subheader("🚨 إشارات نشطة")
         for z in touched_zones:
             with st.container():
-                if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
-                else: st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
+                if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} - Zone Achat**")
+                else: st.error(f"🔴 **{z['type']} - Zone Vente**")
                 
                 col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("💰 الدخول", f"{z['entry']:.4f}")
@@ -261,7 +311,7 @@ try:
                 col4.metric("🎯 TP2", f"{z['tp2']:.4f}")
                 col5.metric("📊 اللوت", calc_lot(z['entry'], z['sl'], symbol))
                 
-                if st.button(f"🤖 استشارة AI ({z['type']})", key=f"ai_{z['type']}_{z['time']}"):
+                if st.button(f"🤖 استشارة AI", key=f"ai_{z['type']}_{z['time']}"):
                     with st.spinner("..."):
                         decision = ask_ai(z, trend)
                         st.info(f"🧠 {decision}")
@@ -270,15 +320,12 @@ try:
                             if send_tg(msg): st.success("✅ تم إرسال التنبيه!")
     
     if waiting_zones:
-        st.subheader("⏳ مناطق في الانتظار (لم تُلمس بعد)")
+        st.subheader("⏳ مناطق في الانتظار")
         for z in waiting_zones:
             if z['type'] == 'BUY':
-                st.info(f"🟢 **Zone Achat** | النطاق: {z['bottom']:.4f} - {z['top']:.4f} | السعر ينتظر الوصول")
+                st.info(f"🟢 **Zone Achat** | النطاق: {z['bottom']:.4f} - {z['top']:.4f}")
             else:
-                st.info(f"🔴 **Zone Vente** | النطاق: {z['bottom']:.4f} - {z['top']:.4f} | السعر ينتظر الوصول")
-    
-    if not touched_zones and not waiting_zones:
-        st.warning("ℹ️ لا توجد مناطق SMC حالياً. جرب فريماً آخر أو انتظر التحديث.")
+                st.info(f"🔴 **Zone Vente** | النطاق: {z['bottom']:.4f} - {z['top']:.4f}")
 
 except Exception as e:
     st.error(f"❌ خطأ: {str(e)}")
