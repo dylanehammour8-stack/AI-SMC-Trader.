@@ -8,6 +8,9 @@ from groq import Groq
 from streamlit_lightweight_charts import renderLightweightCharts
 from streamlit_autorefresh import st_autorefresh
 
+# ==========================================
+# إعدادات الصفحة
+# ==========================================
 st.set_page_config(page_title="AI SMC Trader", page_icon="📊", layout="wide")
 
 # 🛑 ضع مفاتيحك هنا 🛑
@@ -15,6 +18,7 @@ TELEGRAM_TOKEN = "8959270070:AAGc1IxMWlc32bzBHoMX_7KcBRiJSsL0nxA"
 TELEGRAM_CHAT_ID = "8619074139"
 GROQ_API_KEY = "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"
 
+# إعدادات إدارة المخاطر
 ACCOUNT_BALANCE = 1000
 RISK_PERCENT = 1.0
 
@@ -22,11 +26,12 @@ RISK_PERCENT = 1.0
 st_autorefresh(interval=30000, key="auto_refresh")
 
 # ==========================================
-# جلب البيانات
+# 1. محرك جلب البيانات (يدعم كل الأسواق)
 # ==========================================
 def fetch_data(symbol, timeframe='15m', limit=300):
     crypto_keywords = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE']
     is_crypto = any(c in symbol.upper() for c in crypto_keywords) or '/' in symbol
+    
     if is_crypto:
         try:
             exchange = ccxt.binance()
@@ -36,9 +41,11 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             df['time'] = pd.to_datetime(df['time'], unit='ms')
             df.set_index('time', inplace=True)
             return df
-        except:
+        except Exception as e:
+            st.warning(f"⚠️ فشل جلب الكريبتو من Binance، سنجرب Yahoo...")
             symbol = symbol.replace('/', '-').replace('USDT', 'USD')
             is_crypto = False
+            
     if not is_crypto:
         symbol_map = {'XAUUSD': 'GC=F', 'GOLD': 'GC=F', 'EURUSD': 'EURUSD=X', 'GBPUSD': 'GBPUSD=X', 'SP500': '^GSPC', 'NAS100': '^NDX'}
         yf_symbol = symbol_map.get(symbol.upper(), symbol)
@@ -48,12 +55,13 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
             return df
-        except:
+        except Exception as e:
+            st.error(f"❌ خطأ في جلب البيانات: {e}")
             return pd.DataFrame()
     return df
 
 # ==========================================
-# محرك SMC: اكتشاف المناطق وانتظار اللمس
+# 2. محرك تحليل SMC (المناطق واللمس)
 # ==========================================
 def detect_zones(df, lookback=10):
     df = df.copy()
@@ -119,27 +127,44 @@ def detect_zones(df, lookback=10):
             active_zones.append(z)
     return df, active_zones
 
+# ==========================================
+# 3. إدارة المخاطر (حساب اللوت)
+# ==========================================
 def calc_lot(entry, sl, symbol):
     risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
     distance = abs(entry - sl)
     if distance == 0: return 0.01
-    if 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): pv = 100
-    elif 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): pv = 1
-    else: pv = 100000
-    lot = risk_amount / (distance * pv)
-    max_lot = 0.01 if ('BTC' in symbol.upper() or 'ETH' in symbol.upper()) else 0.1
+    
+    if 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): point_value = 100
+    elif 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): point_value = 1
+    else: point_value = 100000
+    
+    lot = risk_amount / (distance * point_value)
+    
+    if 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): max_lot = 0.01
+    elif 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): max_lot = 0.1
+    else: max_lot = 0.1
+    
     return max(0.01, min(round(lot, 2), max_lot))
 
+# ==========================================
+# 4. الذكاء الاصطناعي (AI Brain)
+# ==========================================
 def ask_ai(setup, trend):
     client = Groq(api_key=GROQ_API_KEY)
-    prompt = f"خبير SMC. إشارة: {setup['type']} | دخول: {setup['entry']:.4f} | SL: {setup['sl']:.4f} | TP1: {setup['tp1']:.4f} | الاتجاه: {trend}. هل الصفقة قوية؟ أجب بـ نعم أو لا مع سبب مختصر."
-    for m in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "allam-2-7b", "openai/gpt-oss-20b"]:
+    prompt = f"أنت خبير SMC. إشارة: {setup['type']} | دخول: {setup['entry']:.4f} | SL: {setup['sl']:.4f} | TP1: {setup['tp1']:.4f} | الاتجاه العام: {trend}. هل الصفقة قوية؟ أجب بـ نعم أو لا مع سبب مختصر."
+    
+    models = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "allam-2-7b", "openai/gpt-oss-20b"]
+    for m in models:
         try:
             res = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model=m)
             return res.choices[0].message.content
         except: continue
-    return "تعذر الاتصال"
+    return "تعذر الاتصال بالذكاء الاصطناعي"
 
+# ==========================================
+# 5. إرسال التنبيهات (Telegram)
+# ==========================================
 def send_tg(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -148,22 +173,23 @@ def send_tg(msg):
     except: return False
 
 # ==========================================
-# رسم شارت TradingView
+# 6. رسم شارت TradingView (نسخة مصححة)
 # ==========================================
 def render_tv_chart(df, zones, symbol, timeframe):
     df_chart = df.reset_index()
-    time_col = df_chart.columns[0]
-    df_chart.rename(columns={time_col: 'time'}, inplace=True)
+    df_chart.rename(columns={df_chart.columns[0]: 'time'}, inplace=True)
     
-    # تحويل الوقت لـ Unix timestamp (بالثواني)
-    if pd.api.types.is_datetime64_any_dtype(df_chart['time']):
-        df_chart['time'] = df_chart['time'].astype('int64') // 10**9
-    else:
-        df_chart['time'] = pd.to_datetime(df_chart['time']).astype('int64') // 10**9
+    # تصحيح تحويل الوقت إلى Unix timestamp (بالثواني)
+    df_chart['time'] = pd.to_datetime(df_chart['time']).astype('int64') // 10**9
+    
+    for col in ['open', 'high', 'low', 'close']:
+        df_chart[col] = pd.to_numeric(df_chart[col], errors='coerce')
+    
+    df_chart.dropna(subset=['time', 'open', 'high', 'low', 'close'], inplace=True)
+    df_chart = df_chart.sort_values('time')
     
     candles = df_chart[['time', 'open', 'high', 'low', 'close']].to_dict('records')
     
-    # بناء خطوط الأسعار للمناطق
     price_lines = []
     for z in zones:
         if z['type'] == 'BUY':
@@ -175,8 +201,8 @@ def render_tv_chart(df, zones, symbol, timeframe):
             color_bot = 'rgba(239, 83, 80, 0.5)'
             label = "ZONE VENTE"
         
-        price_lines.append({"price": z['top'], "color": color_top, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} (Top)"})
-        price_lines.append({"price": z['bottom'], "color": color_bot, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} (Bottom)"})
+        price_lines.append({"price": z['top'], "color": color_top, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} Top"})
+        price_lines.append({"price": z['bottom'], "color": color_bot, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} Bot"})
         
         if z['status'] == 'Touched':
             price_lines.append({"price": z['entry'], "color": '#2962FF', "lineWidth": 2, "lineStyle": 0, "axisLabelVisible": True, "title": "ENTRY"})
@@ -185,44 +211,24 @@ def render_tv_chart(df, zones, symbol, timeframe):
             price_lines.append({"price": z['tp2'], "color": '#00C853', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP2"})
 
     chartOptions = {
-        "layout": {
-            "background": {"type": 'solid', "color": '#131722'},
-            "textColor": '#D9D9D9',
-            "fontSize": 12,
-        },
-        "grid": {
-            "vertLines": {"color": 'rgba(42, 46, 57, 0.5)'},
-            "horzLines": {"color": 'rgba(42, 46, 57, 0.5)'},
-        },
-        "timeScale": {
-            "timeVisible": True,
-            "secondsVisible": False,
-            "borderColor": '#2B2B43',
-        },
-        "rightPriceScale": {
-            "borderColor": '#2B2B43',
-            "scaleMargins": {"top": 0.1, "bottom": 0.1},
-        },
+        "layout": {"background": {"type": 'solid', "color": '#131722'}, "textColor": '#D9D9D9', "fontSize": 12},
+        "grid": {"vertLines": {"color": 'rgba(42, 46, 57, 0.5)'}, "horzLines": {"color": 'rgba(42, 46, 57, 0.5)'}},
+        "timeScale": {"timeVisible": True, "secondsVisible": False, "borderColor": '#2B2B43'},
+        "rightPriceScale": {"borderColor": '#2B2B43', "scaleMargins": {"top": 0.1, "bottom": 0.1}},
         "crosshair": {"mode": 0},
     }
     
     seriesCandlestick = [{
         "type": 'Candlestick',
         "data": candles,
-        "options": {
-            "upColor": '#26a69a',
-            "downColor": '#ef5350',
-            "borderVisible": False,
-            "wickUpColor": '#26a69a',
-            "wickDownColor": '#ef5350',
-        },
+        "options": {"upColor": '#26a69a', "downColor": '#ef5350', "borderVisible": False, "wickUpColor": '#26a69a', "wickDownColor": '#ef5350'},
         "priceLines": price_lines
     }]
     
     renderLightweightCharts([{"chart": chartOptions, "series": seriesCandlestick}], f'tv_chart_{symbol}_{timeframe}')
 
 # ==========================================
-# واجهة المستخدم
+# 7. واجهة المستخدم الرئيسية
 # ==========================================
 st.title("📊 AI SMC Trader - Live TradingView Chart")
 
@@ -243,14 +249,16 @@ try:
         st.error("❌ فشل جلب البيانات. جرب أصلاً آخر.")
         st.stop()
     
+    # الاتجاه العام
     ema = df_htf['close'].ewm(span=50).mean().iloc[-1]
     trend = "صعودي 📈" if df_htf['close'].iloc[-1] > ema else "هبوطي 📉"
+    
+    # السعر الحي
     current_price = float(df_ltf['close'].iloc[-1])
     prev_price = float(df_ltf['close'].iloc[-2]) if len(df_ltf) > 1 else current_price
     change = current_price - prev_price
     change_pct = (change / prev_price) * 100 if prev_price != 0 else 0
     
-    # عرض السعر الحي
     st.markdown(f"### {symbol} | {timeframe}")
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     col1.metric("💵 السعر الحالي", f"{current_price:.4f}", f"{change:+.4f} ({change_pct:+.2f}%)")
@@ -264,9 +272,7 @@ try:
     # رسم شارت TradingView
     render_tv_chart(df, active_zones, symbol, timeframe)
     
-    # ==========================================
-    # عرض الصفقات والمناطق
-    # ==========================================
+    # عرض الصفقات
     touched_zones = [z for z in active_zones if z['status'] == 'Touched']
     waiting_zones = [z for z in active_zones if z['status'] == 'Waiting']
     
@@ -276,10 +282,9 @@ try:
         st.subheader("🚨 إشارات نشطة (تم لمس المنطقة)")
         for z in touched_zones:
             with st.container():
-                if z['type'] == 'BUY':
-                    st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
-                else:
-                    st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
+                if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
+                else: st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
+                
                 col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("💰 الدخول", f"{z['entry']:.4f}")
                 col2.metric("🛑 SL", f"{z['sl']:.4f}")
