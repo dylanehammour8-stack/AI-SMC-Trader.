@@ -6,3 +6,5 @@ numpy
 plotly
 groq
 requests
+streamlit-lightweight-charts
+streamlit-autorefresh
