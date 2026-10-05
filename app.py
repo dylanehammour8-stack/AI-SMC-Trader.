@@ -3,9 +3,10 @@ import yfinance as yf
 import ccxt
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import requests
 from groq import Groq
+from streamlit_lightweight_charts import renderLightweightCharts
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="AI SMC Trader", page_icon="📊", layout="wide")
 
@@ -17,27 +18,27 @@ GROQ_API_KEY = "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"
 ACCOUNT_BALANCE = 1000
 RISK_PERCENT = 1.0
 
+# تحديث تلقائي كل 30 ثانية
+st_autorefresh(interval=30000, key="auto_refresh")
+
 # ==========================================
-# دوال جلب البيانات
+# جلب البيانات
 # ==========================================
-def fetch_data(symbol, timeframe='15m', limit=500):
+def fetch_data(symbol, timeframe='15m', limit=300):
     crypto_keywords = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE']
     is_crypto = any(c in symbol.upper() for c in crypto_keywords) or '/' in symbol
-    
     if is_crypto:
         try:
             exchange = ccxt.binance()
             if '/' not in symbol: symbol = symbol.replace('USDT', '/USDT')
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            st.success(f"✅ تم جلب بيانات {symbol} من Binance.")
-        except Exception as e:
-            st.warning("⚠️ فشل جلب الكريبتو من Binance، سنجرب Yahoo...")
+            df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            df.set_index('time', inplace=True)
+            return df
+        except:
             symbol = symbol.replace('/', '-').replace('USDT', 'USD')
             is_crypto = False
-            
     if not is_crypto:
         symbol_map = {'XAUUSD': 'GC=F', 'GOLD': 'GC=F', 'EURUSD': 'EURUSD=X', 'GBPUSD': 'GBPUSD=X', 'SP500': '^GSPC', 'NAS100': '^NDX'}
         yf_symbol = symbol_map.get(symbol.upper(), symbol)
@@ -46,74 +47,98 @@ def fetch_data(symbol, timeframe='15m', limit=500):
             df = yf.download(yf_symbol, interval=timeframe, period=period, progress=False)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
-            st.success(f"✅ تم جلب بيانات {symbol} من Yahoo.")
-        except Exception as e:
-            st.error(f"❌ فشل جلب البيانات: {e}")
+            return df
+        except:
             return pd.DataFrame()
-            
-    df.dropna(inplace=True)
     return df
 
 # ==========================================
-# محرك تحليل SMC
+# محرك SMC: اكتشاف المناطق وانتظار اللمس
 # ==========================================
-def analyze_smc(df, lookback=10):
+def detect_zones(df, lookback=10):
     df = df.copy()
     df['swing_high'] = df['high'].rolling(window=lookback*2+1, center=True).max() == df['high']
     df['swing_low'] = df['low'].rolling(window=lookback*2+1, center=True).min() == df['low']
     
-    setups = []
+    zones = []
     last_sh, last_sl = np.nan, np.nan
 
     for i in range(lookback, len(df) - lookback):
         if df['swing_high'].iloc[i]: last_sh = df['high'].iloc[i]
         if df['swing_low'].iloc[i]: last_sl = df['low'].iloc[i]
         
-        # كشف BUY (Zone d'Achat)
+        # منطقة بيع (Supply Zone)
         if not np.isnan(last_sh) and df['close'].iloc[i] > last_sh and df['close'].iloc[i-1] <= last_sh:
             for j in range(1, 20):
-                if i-j >= 0 and df['close'].iloc[i-j] < df['open'].iloc[i-j]:
-                    ot, ob = df['high'].iloc[i-j], df['low'].iloc[i-j]
-                    if abs(ot - ob) > 0.0001 * ot: # فلتر المسافة
-                        setups.append({'type': 'BUY', 'time': df.index[i-j], 'top': ot, 'bottom': ob,
-                                       'entry': ot, 'sl': ob, 'tp1': ot+(ot-ob)*1.5, 'tp2': ot+(ot-ob)*2.5})
+                if i-j >= 0 and df['close'].iloc[i-j] > df['open'].iloc[i-j]:
+                    zones.append({
+                        'type': 'SELL', 'time': df.index[i-j],
+                        'top': float(df['high'].iloc[i-j]), 'bottom': float(df['low'].iloc[i-j]),
+                        'status': 'Waiting'
+                    })
                     break
         
-        # كشف SELL (Zone de Vente)
+        # منطقة شراء (Demand Zone)
         if not np.isnan(last_sl) and df['close'].iloc[i] < last_sl and df['close'].iloc[i-1] >= last_sl:
             for j in range(1, 20):
-                if i-j >= 0 and df['close'].iloc[i-j] > df['open'].iloc[i-j]:
-                    ot, ob = df['high'].iloc[i-j], df['low'].iloc[i-j]
-                    if abs(ot - ob) > 0.0001 * ot: # فلتر المسافة
-                        setups.append({'type': 'SELL', 'time': df.index[i-j], 'top': ot, 'bottom': ob,
-                                       'entry': ob, 'sl': ot, 'tp1': ob-(ot-ob)*1.5, 'tp2': ob-(ot-ob)*2.5})
+                if i-j >= 0 and df['close'].iloc[i-j] < df['open'].iloc[i-j]:
+                    zones.append({
+                        'type': 'BUY', 'time': df.index[i-j],
+                        'top': float(df['high'].iloc[i-j]), 'bottom': float(df['low'].iloc[i-j]),
+                        'status': 'Waiting'
+                    })
                     break
-    return df, setups
+
+    # تحديث حالة اللمس
+    current_price = float(df['close'].iloc[-1])
+    current_high = float(df['high'].iloc[-1])
+    current_low = float(df['low'].iloc[-1])
+    
+    active_zones = []
+    for z in zones[-8:]:
+        if z['type'] == 'BUY':
+            if current_low <= z['top'] and current_low >= z['bottom']:
+                z['status'] = 'Touched'
+                z['entry'] = z['top']
+                z['sl'] = z['bottom']
+                z['tp1'] = z['entry'] + (z['entry'] - z['sl']) * 1.5
+                z['tp2'] = z['entry'] + (z['entry'] - z['sl']) * 2.5
+            elif current_price < z['bottom']:
+                z['status'] = 'Invalid'
+        elif z['type'] == 'SELL':
+            if current_high >= z['bottom'] and current_high <= z['top']:
+                z['status'] = 'Touched'
+                z['entry'] = z['bottom']
+                z['sl'] = z['top']
+                z['tp1'] = z['entry'] - (z['sl'] - z['entry']) * 1.5
+                z['tp2'] = z['entry'] - (z['sl'] - z['entry']) * 2.5
+            elif current_price > z['top']:
+                z['status'] = 'Invalid'
+                
+        if z['status'] in ['Waiting', 'Touched']:
+            active_zones.append(z)
+    return df, active_zones
 
 def calc_lot(entry, sl, symbol):
     risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
     distance = abs(entry - sl)
-    if distance == 0: return 0
-    if 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): point_value = 100
-    elif 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): point_value = 1
-    else: point_value = 100000
-    lot = risk_amount / (distance * point_value)
-    # حدود قصوى آمنة
-    if 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): max_lot = 0.01
-    elif 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): max_lot = 0.1
-    else: max_lot = 0.1
-    return min(round(lot, 2), max_lot)
+    if distance == 0: return 0.01
+    if 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): pv = 100
+    elif 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): pv = 1
+    else: pv = 100000
+    lot = risk_amount / (distance * pv)
+    max_lot = 0.01 if ('BTC' in symbol.upper() or 'ETH' in symbol.upper()) else 0.1
+    return max(0.01, min(round(lot, 2), max_lot))
 
-def ask_ai(setup, trend, news_warning):
+def ask_ai(setup, trend):
     client = Groq(api_key=GROQ_API_KEY)
-    prompt = f"أنت خبير SMC. إشارة: {setup['type']} | دخول: {setup['entry']:.4f} | SL: {setup['sl']:.4f} | TP: {setup['tp1']:.4f} | الاتجاه: {trend}. هل الصفقة قوية؟ أجب بـ نعم أو لا مع سبب مختصر."
-    models = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "allam-2-7b", "openai/gpt-oss-20b"]
-    for m in models:
+    prompt = f"خبير SMC. إشارة: {setup['type']} | دخول: {setup['entry']:.4f} | SL: {setup['sl']:.4f} | TP1: {setup['tp1']:.4f} | الاتجاه: {trend}. هل الصفقة قوية؟ أجب بـ نعم أو لا مع سبب مختصر."
+    for m in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "allam-2-7b", "openai/gpt-oss-20b"]:
         try:
             res = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model=m)
             return res.choices[0].message.content
         except: continue
-    return "تعذر الاتصال بالذكاء الاصطناعي"
+    return "تعذر الاتصال"
 
 def send_tg(msg):
     try:
@@ -123,96 +148,163 @@ def send_tg(msg):
     except: return False
 
 # ==========================================
+# رسم شارت TradingView
+# ==========================================
+def render_tv_chart(df, zones, symbol, timeframe):
+    df_chart = df.reset_index()
+    time_col = df_chart.columns[0]
+    df_chart.rename(columns={time_col: 'time'}, inplace=True)
+    
+    # تحويل الوقت لـ Unix timestamp (بالثواني)
+    if pd.api.types.is_datetime64_any_dtype(df_chart['time']):
+        df_chart['time'] = df_chart['time'].astype('int64') // 10**9
+    else:
+        df_chart['time'] = pd.to_datetime(df_chart['time']).astype('int64') // 10**9
+    
+    candles = df_chart[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+    
+    # بناء خطوط الأسعار للمناطق
+    price_lines = []
+    for z in zones:
+        if z['type'] == 'BUY':
+            color_top = 'rgba(38, 166, 154, 0.9)'
+            color_bot = 'rgba(38, 166, 154, 0.5)'
+            label = "ZONE ACHAT"
+        else:
+            color_top = 'rgba(239, 83, 80, 0.9)'
+            color_bot = 'rgba(239, 83, 80, 0.5)'
+            label = "ZONE VENTE"
+        
+        price_lines.append({"price": z['top'], "color": color_top, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} (Top)"})
+        price_lines.append({"price": z['bottom'], "color": color_bot, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} (Bottom)"})
+        
+        if z['status'] == 'Touched':
+            price_lines.append({"price": z['entry'], "color": '#2962FF', "lineWidth": 2, "lineStyle": 0, "axisLabelVisible": True, "title": "ENTRY"})
+            price_lines.append({"price": z['sl'], "color": '#FF1744', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "SL"})
+            price_lines.append({"price": z['tp1'], "color": '#00E676', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP1"})
+            price_lines.append({"price": z['tp2'], "color": '#00C853', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP2"})
+
+    chartOptions = {
+        "layout": {
+            "background": {"type": 'solid', "color": '#131722'},
+            "textColor": '#D9D9D9',
+            "fontSize": 12,
+        },
+        "grid": {
+            "vertLines": {"color": 'rgba(42, 46, 57, 0.5)'},
+            "horzLines": {"color": 'rgba(42, 46, 57, 0.5)'},
+        },
+        "timeScale": {
+            "timeVisible": True,
+            "secondsVisible": False,
+            "borderColor": '#2B2B43',
+        },
+        "rightPriceScale": {
+            "borderColor": '#2B2B43',
+            "scaleMargins": {"top": 0.1, "bottom": 0.1},
+        },
+        "crosshair": {"mode": 0},
+    }
+    
+    seriesCandlestick = [{
+        "type": 'Candlestick',
+        "data": candles,
+        "options": {
+            "upColor": '#26a69a',
+            "downColor": '#ef5350',
+            "borderVisible": False,
+            "wickUpColor": '#26a69a',
+            "wickDownColor": '#ef5350',
+        },
+        "priceLines": price_lines
+    }]
+    
+    renderLightweightCharts([{"chart": chartOptions, "series": seriesCandlestick}], f'tv_chart_{symbol}_{timeframe}')
+
+# ==========================================
 # واجهة المستخدم
 # ==========================================
-st.title("📊 AI SMC Trader - Zone d'Achat & Zone de Vente")
+st.title("📊 AI SMC Trader - Live TradingView Chart")
 
 with st.sidebar:
     st.header("⚙️ اختيار السوق")
-    symbol = st.selectbox("اختر الأصل", ["BTC-USD", "ETH-USD", "GC=F (Or)", "EURUSD=X", "GBPUSD=X", "^GSPC (S&P500)"])
-    # تنظيف الرمز المختار
-    if " (" in symbol: symbol = symbol.split(" ")[0]
-    
-    timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h", "1d"])
+    symbol_choice = st.selectbox("اختر الأصل", ["BTC-USD", "ETH-USD", "GC=F (Or)", "EURUSD=X", "GBPUSD=X", "^GSPC (S&P500)"])
+    symbol = symbol_choice.split(" ")[0]
+    timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h"])
     st.divider()
-    analyze_btn = st.button("🚀 تحليل السوق", use_container_width=True)
     st.caption(f"💰 رأس المال: ${ACCOUNT_BALANCE} | المخاطرة: {RISK_PERCENT}%")
+    st.caption("🔄 التحديث التلقائي: كل 30 ثانية")
 
-if analyze_btn:
-    with st.spinner(f"🔄 جاري جلب بيانات {symbol} وتحليلها..."):
-        try:
-            df_ltf = fetch_data(symbol, timeframe)
-            df_htf = fetch_data(symbol, '4h')
-            
-            if df_ltf.empty or df_htf.empty:
-                st.error("❌ فشل جلب البيانات. جرب أصلاً آخر.")
-                st.stop()
-            
-            ema = df_htf['close'].ewm(span=50).mean().iloc[-1]
-            trend = "صعودي 📈" if df_htf['close'].iloc[-1] > ema else "هبوطي 📉"
-            df, setups = analyze_smc(df_ltf)
-            
-            # ==========================================
-            # عرض الشارت
-            # ==========================================
-            fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'],
-                                                 low=df['low'], close=df['close'], name='Price')])
-            
-            if setups:
-                # عرض آخر إشارة فقط للحفاظ على نظافة الشارت
-                s = setups[-1]
-                if s['type'] == 'BUY':
-                    color = 'rgba(0, 255, 0, 0.2)' # Zone d'Achat (أخضر)
-                    line_color = 'green'
-                    label_zone = "Zone d'Achat (BUY)"
+try:
+    df_ltf = fetch_data(symbol, timeframe)
+    df_htf = fetch_data(symbol, '4h')
+    
+    if df_ltf.empty or df_htf.empty:
+        st.error("❌ فشل جلب البيانات. جرب أصلاً آخر.")
+        st.stop()
+    
+    ema = df_htf['close'].ewm(span=50).mean().iloc[-1]
+    trend = "صعودي 📈" if df_htf['close'].iloc[-1] > ema else "هبوطي 📉"
+    current_price = float(df_ltf['close'].iloc[-1])
+    prev_price = float(df_ltf['close'].iloc[-2]) if len(df_ltf) > 1 else current_price
+    change = current_price - prev_price
+    change_pct = (change / prev_price) * 100 if prev_price != 0 else 0
+    
+    # عرض السعر الحي
+    st.markdown(f"### {symbol} | {timeframe}")
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    col1.metric("💵 السعر الحالي", f"{current_price:.4f}", f"{change:+.4f} ({change_pct:+.2f}%)")
+    col2.metric("اتجاه 4H", trend)
+    col3.metric("آخر تحديث", pd.Timestamp.now().strftime("%H:%M:%S"))
+    col4.metric("الحالة", "🟢 مباشر")
+    
+    # كشف المناطق
+    df, active_zones = detect_zones(df_ltf)
+    
+    # رسم شارت TradingView
+    render_tv_chart(df, active_zones, symbol, timeframe)
+    
+    # ==========================================
+    # عرض الصفقات والمناطق
+    # ==========================================
+    touched_zones = [z for z in active_zones if z['status'] == 'Touched']
+    waiting_zones = [z for z in active_zones if z['status'] == 'Waiting']
+    
+    st.divider()
+    
+    if touched_zones:
+        st.subheader("🚨 إشارات نشطة (تم لمس المنطقة)")
+        for z in touched_zones:
+            with st.container():
+                if z['type'] == 'BUY':
+                    st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
                 else:
-                    color = 'rgba(255, 0, 0, 0.2)' # Zone de Vente (أحمر)
-                    line_color = 'red'
-                    label_zone = "Zone de Vente (SELL)"
-
-                # رسم مربع المنطقة (Order Block)
-                fig.add_shape(type="rect", x0=s['time'], y0=s['bottom'], x1=df.index[-1], y1=s['top'],
-                              fillcolor=color, line=dict(color=line_color, width=2), layer="below")
-                
-                # إضافة نص للمنطقة
-                fig.add_annotation(x=s['time'], y=s['top'], text=label_zone, showarrow=False, 
-                                   yshift=10, font=dict(color=line_color, size=12))
-
-                # رسم خطوط الدخول، وقف الخسارة، والأهداف
-                fig.add_hline(y=s['entry'], line_dash="solid", line_color="blue", annotation_text="Entry (Dخول)")
-                fig.add_hline(y=s['sl'], line_dash="dash", line_color="red", annotation_text="SL (Stop Loss)")
-                fig.add_hline(y=s['tp1'], line_dash="dot", line_color="green", annotation_text="TP1")
-                fig.add_hline(y=s['tp2'], line_dash="dot", line_color="darkgreen", annotation_text="TP2")
-
-            fig.update_layout(xaxis_rangeslider_visible=False, height=500, template="plotly_dark",
-                              title=f"Analyse SMC: {symbol} - {timeframe}",
-                              xaxis_title="Date", yaxis_title="Prix")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # ==========================================
-            # عرض المعلومات والصفقات
-            # ==========================================
-            if setups:
-                last_setup = setups[-1]
-                st.divider()
-                st.subheader(f"🎯 إشارة {last_setup['type']} تم اكتشافها")
-                
+                    st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
                 col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("💰 الدخول", f"{last_setup['entry']:.4f}")
-                col2.metric("🛑 وقف الخسارة", f"{last_setup['sl']:.4f}")
-                col3.metric("🎯 TP1", f"{last_setup['tp1']:.4f}")
-                col4.metric("🎯 TP2", f"{last_setup['tp2']:.4f}")
-                col5.metric("📊 اللوت", calc_lot(last_setup['entry'], last_setup['sl'], symbol))
+                col1.metric("💰 الدخول", f"{z['entry']:.4f}")
+                col2.metric("🛑 SL", f"{z['sl']:.4f}")
+                col3.metric("🎯 TP1", f"{z['tp1']:.4f}")
+                col4.metric("🎯 TP2", f"{z['tp2']:.4f}")
+                col5.metric("📊 اللوت", calc_lot(z['entry'], z['sl'], symbol))
                 
-                if st.button("🤖 استشارة الذكاء الاصطناعي", use_container_width=True):
-                    with st.spinner("جاري التحليل..."):
-                        decision = ask_ai(last_setup, trend, "لا توجد أخبار")
-                        st.info(f"🧠 **قرار AI:** {decision}")
+                if st.button(f"🤖 استشارة AI ({z['type']})", key=f"ai_{z['type']}_{z['time']}"):
+                    with st.spinner("..."):
+                        decision = ask_ai(z, trend)
+                        st.info(f"🧠 {decision}")
                         if "نعم" in decision:
-                            msg = f"🚨 إشارة {last_setup['type']} على {symbol}\nدخول: {last_setup['entry']:.4f}\nSL: {last_setup['sl']:.4f}\nTP1: {last_setup['tp1']:.4f}"
-                            if send_tg(msg): st.success("✅ تم إرسال التنبيه لتلغرام!")
+                            msg = f"🚨 إشارة {z['type']} على {symbol}\nدخول: {z['entry']:.4f}\nSL: {z['sl']:.4f}\nTP1: {z['tp1']:.4f}"
+                            if send_tg(msg): st.success("✅ تم إرسال التنبيه!")
+    
+    if waiting_zones:
+        st.subheader("⏳ مناطق في الانتظار (لم تُلمس بعد)")
+        for z in waiting_zones:
+            if z['type'] == 'BUY':
+                st.info(f"🟢 **Zone Achat** | النطاق: {z['bottom']:.4f} - {z['top']:.4f} | السعر ينتظر الوصول")
             else:
-                st.warning("ℹ️ لا توجد إشارات Order Block حالياً في هذا الفريم. جرب فريماً آخر.")
-                
-        except Exception as e:
-            st.error(f"❌ حدث خطأ: {str(e)}")
+                st.info(f"🔴 **Zone Vente** | النطاق: {z['bottom']:.4f} - {z['top']:.4f} | السعر ينتظر الوصول")
+    
+    if not touched_zones and not waiting_zones:
+        st.warning("ℹ️ لا توجد مناطق SMC حالياً. جرب فريماً آخر أو انتظر التحديث.")
+
+except Exception as e:
+    st.error(f"❌ خطأ: {str(e)}")
