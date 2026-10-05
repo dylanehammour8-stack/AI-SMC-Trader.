@@ -51,7 +51,7 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             df = yf.download(yf_symbol, interval=timeframe, period=period, progress=False)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
-            # 🛠️ إصلاح الوقت: إزالة المنطقة الزمنية ليعمل Plotly بشكل صحيح
+            # إزالة المنطقة الزمنية لتجنب مشاكل العرض
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             return df
@@ -178,11 +178,13 @@ def update_trades(current_price):
     st.session_state.trades = updated_trades
 
 # ==========================================
-# 5. رسم الشارت (نسخة نهائية تسمح بالتكبير والتحريك)
+# 5. رسم الشارت (المناطق والصفقات داخل الشارت)
 # ==========================================
-def render_plotly_chart(df, zones, symbol, timeframe):
-    # إنشاء الشموع
-    fig = go.Figure(data=[go.Candlestick(
+def render_chart(df, zones, symbol, timeframe):
+    fig = go.Figure()
+    
+    # 1. رسم الشموع
+    fig.add_trace(go.Candlestick(
         x=df.index,
         open=df['open'], high=df['high'],
         low=df['low'], close=df['close'],
@@ -191,60 +193,94 @@ def render_plotly_chart(df, zones, symbol, timeframe):
         decreasing_line_color='#ef5350',
         increasing_fillcolor='#26a69a',
         decreasing_fillcolor='#ef5350'
-    )])
+    ))
     
-    # رسم المناطق
+    # 2. رسم المناطق وخطوط الصفقات داخل الشارت
     for z in zones:
-        color = '#26a69a' if z['type'] == 'BUY' else '#ef5350'
-        label = "ZONE ACHAT" if z['type'] == 'BUY' else "ZONE VENTE"
+        if z['type'] == 'BUY':
+            fill_color = 'rgba(38, 166, 154, 0.15)'
+            border_color = '#26a69a'
+            label_text = "ZONE ACHAT"
+        else:
+            fill_color = 'rgba(239, 83, 80, 0.15)'
+            border_color = '#ef5350'
+            label_text = "ZONE VENTE"
         
-        fig.add_shape(type="rect", x0=z['time'], y0=z['bottom'], x1=df.index[-1], y1=z['top'],
-                      fillcolor='rgba(38, 166, 154, 0.1)' if z['type'] == 'BUY' else 'rgba(239, 83, 80, 0.1)',
-                      line=dict(color=color, width=2, dash="dot"), layer="below")
+        # رسم مربع المنطقة
+        fig.add_shape(
+            type="rect",
+            x0=z['time'], y0=z['bottom'],
+            x1=df.index[-1], y1=z['top'],
+            fillcolor=fill_color,
+            line=dict(color=border_color, width=2, dash="dot"),
+            layer="below"
+        )
         
-        fig.add_annotation(x=df.index[-1], y=z['top'], text=label, showarrow=False, 
-                           xanchor='right', yshift=15, font=dict(color=color, size=12))
+        # إضافة نص اسم المنطقة
+        fig.add_annotation(
+            x=df.index[-1], y=z['top'],
+            text=label_text,
+            showarrow=False,
+            xanchor='right',
+            yshift=15,
+            font=dict(color=border_color, size=12, family="Arial Black")
+        )
         
+        # رسم خطوط الصفقة (Entry, SL, TP) إذا تم لمس المنطقة
         if z['status'] == 'Touched':
-            fig.add_hline(y=z['entry'], line_dash="solid", line_color="#2962FF", annotation_text="Entry")
-            fig.add_hline(y=z['sl'], line_dash="dash", line_color="#FF1744", annotation_text="SL")
-            fig.add_hline(y=z['tp1'], line_dash="dot", line_color="#00E676", annotation_text="TP1")
-            fig.add_hline(y=z['tp2'], line_dash="dot", line_color="#00C853", annotation_text="TP2")
+            # خط الدخول
+            fig.add_hline(y=z['entry'], line_dash="solid", line_color="#2962FF", line_width=2,
+                          annotation_text=f"ENTRY {z['entry']:.4f}", annotation_position="right")
+            # خط وقف الخسارة
+            fig.add_hline(y=z['sl'], line_dash="dash", line_color="#FF1744", line_width=2,
+                          annotation_text=f"SL {z['sl']:.4f}", annotation_position="right")
+            # الهدف الأول
+            fig.add_hline(y=z['tp1'], line_dash="dot", line_color="#00E676", line_width=2,
+                          annotation_text=f"TP1 {z['tp1']:.4f}", annotation_position="right")
+            # الهدف الثاني
+            fig.add_hline(y=z['tp2'], line_dash="dot", line_color="#00C853", line_width=2,
+                          annotation_text=f"TP2 {z['tp2']:.4f}", annotation_position="right")
 
-    # 🛠️ إعدادات الشارت ليكون تفاعلياً بالكامل
+    # 3. إعدادات الشارت
     fig.update_layout(
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
-        height=600, # زيادة الارتفاع
+        height=600,
         margin=dict(l=5, r=5, t=30, b=5),
         xaxis=dict(
-            showgrid=True, 
-            gridcolor='rgba(42, 46, 57, 0.5)', 
-            title="", 
-            tickformat="%H:%M", # تنسيق الوقت
-            type='date'
+            showgrid=True,
+            gridcolor='rgba(42, 46, 57, 0.5)',
+            title="",
+            type='date',
+            tickformat='%d %b %H:%M',  # تنسيق التاريخ والوقت
+            nticks=6
         ),
         yaxis=dict(
-            showgrid=True, 
-            gridcolor='rgba(42, 46, 57, 0.5)', 
-            title="", 
+            showgrid=True,
+            gridcolor='rgba(42, 46, 57, 0.5)',
+            title="Prix",
             side="right",
             autorange=True
         ),
         plot_bgcolor='#131722',
         paper_bgcolor='#131722',
         hovermode='x unified',
-        dragmode='pan', # السماح بالسحب
-        autosize=True
+        dragmode='pan',
+        showlegend=False
     )
     
-    # 🛠️ config يتيح التكبير باللمس (Pinch Zoom) وإظهار الأدوات
-    st.plotly_chart(fig, use_container_width=True, config={
-        'scrollZoom': True, 
-        'displayModeBar': True, 
-        'displaylogo': False,
-        'modeBarButtonsToRemove': ['lasso2d', 'select2d']
-    })
+    # 4. عرض الشارت مع تفعيل التكبير باللمس
+    st.plotly_chart(
+        fig, 
+        use_container_width=True, 
+        config={
+            'scrollZoom': True,          # تفعيل التكبير بالعجلة
+            'displayModeBar': True,      # إظهار شريط الأدوات
+            'displaylogo': False,
+            'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
+            'doubleClick': 'reset'       # نقر مزدوج لإعادة الضبط
+        }
+    )
 
 # ==========================================
 # 6. واجهة المستخدم
@@ -253,17 +289,16 @@ st.title("📊 AI SMC Trader")
 
 with st.sidebar:
     st.header("⚙️ اختيار السوق")
-    symbol_choice = st.selectbox("اختر الأصل", ["BTC-USD", "ETH-USD", "GC=F (Or)", "EURUSD=X", "GBPUSD=X", "^GSPC (S&P500)"])
+    symbol_choice = st.selectbox("اختر الأصل", 
+        ["BTC-USD", "ETH-USD", "GC=F (Or)", "EURUSD=X", "GBPUSD=X", "^GSPC (S&P500)"])
     symbol = symbol_choice.split(" ")[0]
     timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h", "1d"])
     
     st.divider()
     st.caption(f"💰 رأس المال: ${ACCOUNT_BALANCE} | المخاطرة: {RISK_PERCENT}%")
     
-    # 🛠️ زر تحديث يدوي بدلاً من التحديث التلقائي
     if st.button("🔄 تحديث البيانات", use_container_width=True):
         st.rerun()
-        
     if st.button("🗑️ مسح سجل الصفقات", use_container_width=True):
         st.session_state.trades = []
         st.rerun()
@@ -293,7 +328,9 @@ try:
     
     df, active_zones = detect_zones(df_ltf)
     update_trades(current_price)
-    render_plotly_chart(df, active_zones, symbol, timeframe)
+    
+    # رسم الشارت (المناطق والصفقات بالداخل)
+    render_chart(df, active_zones, symbol, timeframe)
     
     touched_zones = [z for z in active_zones if z['status'] == 'Touched']
     waiting_zones = [z for z in active_zones if z['status'] == 'Waiting']
@@ -304,7 +341,7 @@ try:
         st.subheader("📋 مراقبة الصفقات")
         for t in st.session_state.trades:
             status_color = "🟢" if "TP" in t['status'] or "Break" in t['status'] else ("🔴" if "SL" in t['status'] else "🔵")
-            st.markdown(f"{status_color} **{t['type']}** | الدخول: {t['entry']:.4f} | SL: {t['sl']:.4f} | الحالة: {t['status']}")
+            st.markdown(f"{status_color} **{t['type']}** | دخول: {t['entry']:.4f} | SL: {t['sl']:.4f} | {t['status']}")
     
     if touched_zones:
         st.subheader("🚨 إشارات جديدة")
@@ -316,7 +353,6 @@ try:
                     'sl': z['sl'], 'tp1': z['tp1'], 'tp2': z['tp2'],
                     'status': 'Active', 'pnl': '', 'sl_moved': False
                 })
-            
             with st.container():
                 if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
                 else: st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
@@ -331,9 +367,9 @@ try:
         st.subheader("⏳ مناطق في الانتظار")
         for z in waiting_zones:
             if z['type'] == 'BUY':
-                st.info(f"🟢 **Zone Achat** | النطاق: {z['bottom']:.4f} - {z['top']:.4f}")
+                st.info(f"🟢 **Zone Achat** | {z['bottom']:.4f} - {z['top']:.4f}")
             else:
-                st.info(f"🔴 **Zone Vente** | النطاق: {z['bottom']:.4f} - {z['top']:.4f}")
+                st.info(f"🔴 **Zone Vente** | {z['bottom']:.4f} - {z['top']:.4f}")
 
 except Exception as e:
     st.error(f"❌ خطأ: {str(e)}")
