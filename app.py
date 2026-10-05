@@ -3,9 +3,9 @@ import yfinance as yf
 import ccxt
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import requests
 from groq import Groq
+from streamlit_lightweight_charts import renderLightweightCharts
 from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
@@ -42,7 +42,6 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             df.set_index('time', inplace=True)
             return df
         except Exception as e:
-            # Binance تحظر خوادم Streamlit، لذا ننتقل لـ Yahoo
             symbol = symbol.replace('/', '-').replace('USDT', 'USD')
             is_crypto = False
             
@@ -74,7 +73,7 @@ def detect_zones(df, lookback=10):
         if df['swing_high'].iloc[i]: last_sh = df['high'].iloc[i]
         if df['swing_low'].iloc[i]: last_sl = df['low'].iloc[i]
         
-        # منطقة بيع (Supply Zone)
+        # Zone Vente (Supply)
         if not np.isnan(last_sh) and df['close'].iloc[i] > last_sh and df['close'].iloc[i-1] <= last_sh:
             for j in range(1, 20):
                 if i-j >= 0 and df['close'].iloc[i-j] > df['open'].iloc[i-j]:
@@ -85,7 +84,7 @@ def detect_zones(df, lookback=10):
                     })
                     break
         
-        # منطقة شراء (Demand Zone)
+        # Zone Achat (Demand)
         if not np.isnan(last_sl) and df['close'].iloc[i] < last_sl and df['close'].iloc[i-1] >= last_sl:
             for j in range(1, 20):
                 if i-j >= 0 and df['close'].iloc[i-j] < df['open'].iloc[i-j]:
@@ -139,11 +138,7 @@ def calc_lot(entry, sl, symbol):
     else: point_value = 100000
     
     lot = risk_amount / (distance * point_value)
-    
-    if 'BTC' in symbol.upper() or 'ETH' in symbol.upper(): max_lot = 0.01
-    elif 'XAU' in symbol.upper() or 'GOLD' in symbol.upper(): max_lot = 0.1
-    else: max_lot = 0.1
-    
+    max_lot = 0.01 if ('BTC' in symbol.upper() or 'ETH' in symbol.upper()) else 0.1
     return max(0.01, min(round(lot, 2), max_lot))
 
 # ==========================================
@@ -172,58 +167,80 @@ def send_tg(msg):
     except: return False
 
 # ==========================================
-# 6. رسم الشارت باستخدام Plotly (مضمون 100%)
+# 6. رسم شارت TradingView (مصلح 100%)
 # ==========================================
-def render_plotly_chart(df, zones, symbol, timeframe):
-    fig = go.Figure(data=[go.Candlestick(
-        x=df.index,
-        open=df['open'], high=df['high'],
-        low=df['low'], close=df['close'],
-        name='Price',
-        increasing_line_color='#26a69a', # أخضر مثل TradingView
-        decreasing_line_color='#ef5350', # أحمر مثل TradingView
-        increasing_fillcolor='#26a69a',
-        decreasing_fillcolor='#ef5350'
-    )])
+def render_tv_chart(df, zones, symbol, timeframe):
+    df_chart = df.reset_index()
+    df_chart.rename(columns={df_chart.columns[0]: 'time'}, inplace=True)
     
-    # رسم المناطق
+    # 🛠️ الإصلاح: تحويل الوقت إلى Unix timestamp (بالثواني) وتنظيفه
+    df_chart['time'] = pd.to_datetime(df_chart['time']).astype('int64') // 10**9
+    df_chart = df_chart.dropna(subset=['time', 'open', 'high', 'low', 'close'])
+    df_chart = df_chart.sort_values('time')
+    
+    for col in ['open', 'high', 'low', 'close']:
+        df_chart[col] = df_chart[col].astype(float)
+    
+    candles = df_chart[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+    
+    price_lines = []
     for z in zones:
         if z['type'] == 'BUY':
-            fillcolor = 'rgba(38, 166, 154, 0.2)' # Zone Achat أخضر
-            line_color = 'rgba(38, 166, 154, 1)'
-            label = "ZONE ACHAT 🟢"
+            color_top = 'rgba(38, 166, 154, 0.9)'
+            color_bot = 'rgba(38, 166, 154, 0.5)'
+            label = "ZONE ACHAT"
         else:
-            fillcolor = 'rgba(239, 83, 80, 0.2)' # Zone Vente أحمر
-            line_color = 'rgba(239, 83, 80, 1)'
-            label = "ZONE VENTE 🔴"
+            color_top = 'rgba(239, 83, 80, 0.9)'
+            color_bot = 'rgba(239, 83, 80, 0.5)'
+            label = "ZONE VENTE"
         
-        # رسم مربع المنطقة
-        fig.add_shape(type="rect", x0=z['time'], y0=z['bottom'], x1=df.index[-1], y1=z['top'],
-                      fillcolor=fillcolor, line=dict(color=line_color, width=2), layer="below")
+        # خطوط المنطقة
+        price_lines.append({"price": z['top'], "color": color_top, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} Top"})
+        price_lines.append({"price": z['bottom'], "color": color_bot, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": f"{label} Bot"})
         
-        # إضافة اسم المنطقة
-        fig.add_annotation(x=df.index[-1], y=z['top'], text=label, showarrow=False, 
-                           xanchor='right', yshift=15, font=dict(color=line_color, size=12))
-        
-        # إذا تم لمس المنطقة، نرسم خطوط الدخول والأهداف
+        # خطوط الصفقة
         if z['status'] == 'Touched':
-            fig.add_hline(y=z['entry'], line_dash="solid", line_color="#2962FF", annotation_text="Entry")
-            fig.add_hline(y=z['sl'], line_dash="dash", line_color="#FF1744", annotation_text="SL")
-            fig.add_hline(y=z['tp1'], line_dash="dot", line_color="#00E676", annotation_text="TP1")
-            fig.add_hline(y=z['tp2'], line_dash="dot", line_color="#00C853", annotation_text="TP2")
+            price_lines.append({"price": z['entry'], "color": '#2962FF', "lineWidth": 2, "lineStyle": 0, "axisLabelVisible": True, "title": "ENTRY"})
+            price_lines.append({"price": z['sl'], "color": '#FF1744', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "SL"})
+            price_lines.append({"price": z['tp1'], "color": '#00E676', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP1"})
+            price_lines.append({"price": z['tp2'], "color": '#00C853', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP2"})
 
-    fig.update_layout(
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        height=500,
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title=""),
-        yaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="Prix"),
-        plot_bgcolor='#131722',
-        paper_bgcolor='#131722',
-        hovermode='x unified'
-    )
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    chartOptions = {
+        "layout": {
+            "background": {"type": 'solid', "color": '#131722'},
+            "textColor": '#D9D9D9',
+            "fontSize": 12,
+        },
+        "grid": {
+            "vertLines": {"color": 'rgba(42, 46, 57, 0.5)'},
+            "horzLines": {"color": 'rgba(42, 46, 57, 0.5)'},
+        },
+        "timeScale": {
+            "timeVisible": True,
+            "secondsVisible": False,
+            "borderColor": '#2B2B43',
+        },
+        "rightPriceScale": {
+            "borderColor": '#2B2B43',
+            "scaleMargins": {"top": 0.1, "bottom": 0.1},
+        },
+        "crosshair": {"mode": 0},
+    }
+    
+    seriesCandlestick = [{
+        "type": 'Candlestick',
+        "data": candles,
+        "options": {
+            "upColor": '#26a69a',
+            "downColor": '#ef5350',
+            "borderVisible": False,
+            "wickUpColor": '#26a69a',
+            "wickDownColor": '#ef5350',
+        },
+        "priceLines": price_lines
+    }]
+    
+    renderLightweightCharts([{"chart": chartOptions, "series": seriesCandlestick}], f'tv_chart_{symbol}_{timeframe}')
 
 # ==========================================
 # 7. واجهة المستخدم الرئيسية
@@ -267,8 +284,8 @@ try:
     # كشف المناطق
     df, active_zones = detect_zones(df_ltf)
     
-    # رسم شارت Plotly
-    render_plotly_chart(df, active_zones, symbol, timeframe)
+    # رسم شارت TradingView
+    render_tv_chart(df, active_zones, symbol, timeframe)
     
     # عرض الصفقات
     touched_zones = [z for z in active_zones if z['status'] == 'Touched']
