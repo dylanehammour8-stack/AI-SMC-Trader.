@@ -3,10 +3,10 @@ import yfinance as yf
 import ccxt
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 import requests
 from groq import Groq
-from streamlit_lightweight_charts import renderLightweightCharts
-from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
 
 # ==========================================
 # إعدادات الصفحة
@@ -21,8 +21,9 @@ GROQ_API_KEY = "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"
 ACCOUNT_BALANCE = 1000
 RISK_PERCENT = 1.0
 
-# تحديث تلقائي كل 60 ثانية
-st_autorefresh(interval=60000, key="auto_refresh")
+# تهيئة الذاكرة للصفقات
+if 'trades' not in st.session_state:
+    st.session_state.trades = []
 
 # ==========================================
 # 1. جلب البيانات
@@ -45,7 +46,7 @@ def fetch_data(symbol, timeframe='15m', limit=300):
             is_crypto = False
             
     if not is_crypto:
-        symbol_map = {'XAUUSD': 'GC=F', 'GOLD': 'GC=F', 'EURUSD': 'EURUSD=X', 'GBPUSD': 'GBPUSD=X', 'SP500': '^GSPC', 'NAS100': '^NDX'}
+        symbol_map = {'XAUUSD': 'GC=F', 'GOLD': 'GC=F', 'EURUSD': 'EURUSD=X', 'GBPUSD': 'GBPUSD=X', 'SP500': '^GSPC'}
         yf_symbol = symbol_map.get(symbol.upper(), symbol)
         period = "7d" if timeframe in ['1m', '5m', '15m', '30m'] else "1mo"
         try:
@@ -58,7 +59,7 @@ def fetch_data(symbol, timeframe='15m', limit=300):
     return df
 
 # ==========================================
-# 2. تحليل SMC
+# 2. تحليل SMC (كشف المناطق)
 # ==========================================
 def detect_zones(df, lookback=10):
     df = df.copy()
@@ -132,7 +133,7 @@ def calc_lot(entry, sl, symbol):
 
 def ask_ai(setup, trend):
     client = Groq(api_key=GROQ_API_KEY)
-    prompt = f"خبير SMC. إشارة: {setup['type']} | دخول: {setup['entry']:.4f} | SL: {setup['sl']:.4f} | TP1: {setup['tp1']:.4f} | الاتجاه: {trend}. هل الصفقة قوية؟ أجب بـ نعم أو لا مع سبب مختصر."
+    prompt = f"خبير SMC. إشارة: {setup['type']} | دخول: {setup['entry']:.4f} | SL: {setup['sl']:.4f} | TP1: {setup['tp1']:.4f} | الاتجاه: {trend}. هل الصفقة قوية؟ أجب بـ نعم أو لا."
     for m in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "allam-2-7b", "openai/gpt-oss-20b"]:
         try:
             res = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model=m)
@@ -148,114 +149,84 @@ def send_tg(msg):
     except: return False
 
 # ==========================================
-# 4. رسم شارت TradingView (مصحح بالكامل)
+# 4. نظام مراقبة الصفقات (Trade Monitoring)
 # ==========================================
-def render_tv_chart(df, zones, symbol, timeframe):
-    df_chart = df.reset_index()
-    df_chart.rename(columns={df_chart.columns[0]: 'time'}, inplace=True)
+def update_trades(current_price):
+    updated_trades = []
+    for trade in st.session_state.trades:
+        if trade['status'] == 'Active':
+            if trade['type'] == 'BUY':
+                if current_price >= trade['tp2']:
+                    trade['status'] = 'Closed (TP2 Hit)'; trade['pnl'] = 'Win'
+                elif current_price <= trade['sl'] and trade['sl_moved'] == False:
+                    trade['status'] = 'Closed (SL Hit)'; trade['pnl'] = 'Loss'
+                elif current_price >= trade['tp1'] and trade['sl_moved'] == False:
+                    trade['sl'] = trade['entry'] # نقل SL للتعادل
+                    trade['sl_moved'] = True
+                    trade['status'] = 'Active (TP1 Hit - Break Even)'
+            elif trade['type'] == 'SELL':
+                if current_price <= trade['tp2']:
+                    trade['status'] = 'Closed (TP2 Hit)'; trade['pnl'] = 'Win'
+                elif current_price >= trade['sl'] and trade['sl_moved'] == False:
+                    trade['status'] = 'Closed (SL Hit)'; trade['pnl'] = 'Loss'
+                elif current_price <= trade['tp1'] and trade['sl_moved'] == False:
+                    trade['sl'] = trade['entry']
+                    trade['sl_moved'] = True
+                    trade['status'] = 'Active (TP1 Hit - Break Even)'
+        updated_trades.append(trade)
+    st.session_state.trades = updated_trades
+
+# ==========================================
+# 5. رسم شارت Plotly (مضمون 100% ويدعم اللمس)
+# ==========================================
+def render_plotly_chart(df, zones, symbol, timeframe):
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index,
+        open=df['open'], high=df['high'],
+        low=df['low'], close=df['close'],
+        name='Price',
+        increasing_line_color='#26a69a',
+        decreasing_line_color='#ef5350',
+        increasing_fillcolor='#26a69a',
+        decreasing_fillcolor='#ef5350'
+    )])
     
-    # 🛠️ تحويل الوقت إلى Unix timestamp بالثواني (إصلاح جذري)
-    df_chart['time'] = pd.to_datetime(df_chart['time'])
-    df_chart['time'] = df_chart['time'].astype('int64') // 10**9
-    
-    # 🛠️ تنظيف البيانات من التكرار والقيم الفارغة
-    df_chart = df_chart.dropna(subset=['time', 'open', 'high', 'low', 'close'])
-    df_chart = df_chart.drop_duplicates(subset=['time'], keep='last')
-    df_chart = df_chart.sort_values('time').reset_index(drop=True)
-    
-    for col in ['open', 'high', 'low', 'close']:
-        df_chart[col] = pd.to_numeric(df_chart[col], errors='coerce')
-    df_chart = df_chart.dropna()
-    
-    candles = df_chart[['time', 'open', 'high', 'low', 'close']].to_dict('records')
-    
-    # بناء خطوط المناطق والصفقات
-    price_lines = []
     for z in zones:
-        if z['type'] == 'BUY':
-            top_color = '#26a69a'
-            label = "ZONE ACHAT"
-        else:
-            top_color = '#ef5350'
-            label = "ZONE VENTE"
+        color = '#26a69a' if z['type'] == 'BUY' else '#ef5350'
+        label = "ZONE ACHAT" if z['type'] == 'BUY' else "ZONE VENTE"
         
-        price_lines.append({"price": z['top'], "color": top_color, "lineWidth": 2, "lineStyle": 2, "axisLabelVisible": True, "title": label})
-        price_lines.append({"price": z['bottom'], "color": top_color, "lineWidth": 1, "lineStyle": 2, "axisLabelVisible": False})
+        fig.add_shape(type="rect", x0=z['time'], y0=z['bottom'], x1=df.index[-1], y1=z['top'],
+                      fillcolor='rgba(38, 166, 154, 0.1)' if z['type'] == 'BUY' else 'rgba(239, 83, 80, 0.1)',
+                      line=dict(color=color, width=2, dash="dot"), layer="below")
+        
+        fig.add_annotation(x=df.index[-1], y=z['top'], text=label, showarrow=False, 
+                           xanchor='right', yshift=15, font=dict(color=color, size=12))
         
         if z['status'] == 'Touched':
-            price_lines.append({"price": z['entry'], "color": '#2962FF', "lineWidth": 2, "lineStyle": 0, "axisLabelVisible": True, "title": "ENTRY"})
-            price_lines.append({"price": z['sl'], "color": '#FF1744', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "SL"})
-            price_lines.append({"price": z['tp1'], "color": '#00E676', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP1"})
-            price_lines.append({"price": z['tp2'], "color": '#00C853', "lineWidth": 1, "lineStyle": 1, "axisLabelVisible": True, "title": "TP2"})
+            fig.add_hline(y=z['entry'], line_dash="solid", line_color="#2962FF", annotation_text="Entry")
+            fig.add_hline(y=z['sl'], line_dash="dash", line_color="#FF1744", annotation_text="SL")
+            fig.add_hline(y=z['tp1'], line_dash="dot", line_color="#00E676", annotation_text="TP1")
+            fig.add_hline(y=z['tp2'], line_dash="dot", line_color="#00C853", annotation_text="TP2")
 
-    chartOptions = {
-        "height": 500,
-        "layout": {
-            "background": {"type": 'solid', "color": '#131722'},
-            "textColor": '#D9D9D9',
-            "fontSize": 11,
-        },
-        "grid": {
-            "vertLines": {"color": 'rgba(42, 46, 57, 0.5)', "style": 0},
-            "horzLines": {"color": 'rgba(42, 46, 57, 0.5)', "style": 0},
-        },
-        "crosshair": {
-            "mode": 1,
-            "vertLine": {"color": '#758696', "width": 1, "style": 2, "labelBackgroundColor": '#2962FF'},
-            "horzLine": {"color": '#758696', "width": 1, "style": 2, "labelBackgroundColor": '#2962FF'},
-        },
-        "rightPriceScale": {
-            "borderColor": '#2B2B43',
-            "scaleMargins": {"top": 0.1, "bottom": 0.1},
-        },
-        "timeScale": {
-            "timeVisible": True,
-            "secondsVisible": False,
-            "borderColor": '#2B2B43',
-            "rightOffset": 5,
-            "barSpacing": 8,
-            "minBarSpacing": 0.5,
-        },
-        "handleScroll": {
-            "mouseWheel": True,
-            "pressedMouseMove": True,
-            "horzTouchDrag": True,
-            "vertTouchDrag": True,
-        },
-        "handleScale": {
-            "axisPressedMouseMove": True,
-            "mouseWheel": True,
-            "pinch": True,
-        },
-        "kineticScroll": {
-            "touch": True,
-            "mouse": False,
-        },
-    }
-    
-    seriesCandlestick = [{
-        "type": 'Candlestick',
-        "data": candles,
-        "options": {
-            "upColor": '#26a69a',
-            "downColor": '#ef5350',
-            "borderVisible": False,
-            "wickUpColor": '#26a69a',
-            "wickDownColor": '#ef5350',
-            "priceLineVisible": True,
-            "priceLineColor": '#787B86',
-            "priceLineWidth": 1,
-            "lastValueVisible": True,
-        },
-        "priceLines": price_lines
-    }]
-    
-    renderLightweightCharts([{"chart": chartOptions, "series": seriesCandlestick}], f'tv_chart_{symbol}_{timeframe}')
+    fig.update_layout(
+        template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        height=500,
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="", tickformat="%H:%M"),
+        yaxis=dict(showgrid=True, gridcolor='rgba(42, 46, 57, 0.5)', title="Prix", side="right"),
+        plot_bgcolor='#131722',
+        paper_bgcolor='#131722',
+        hovermode='x unified',
+        dragmode='pan' # تفعيل السحب باللمس
+    )
+    # config يسمح بالتكبير باللمس (Pinch Zoom)
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'scrollZoom': True})
 
 # ==========================================
-# 5. واجهة المستخدم
+# 6. واجهة المستخدم الرئيسية
 # ==========================================
-st.title("📊 AI SMC Trader")
+st.title("📊 AI SMC Trader - Pro")
 
 with st.sidebar:
     st.header("⚙️ اختيار السوق")
@@ -264,7 +235,9 @@ with st.sidebar:
     timeframe = st.selectbox("الفريم الزمني", ["5m", "15m", "30m", "1h", "4h", "1d"])
     st.divider()
     st.caption(f"💰 رأس المال: ${ACCOUNT_BALANCE} | المخاطرة: {RISK_PERCENT}%")
-    st.caption("🔄 تحديث كل 60 ثانية")
+    if st.button("🗑️ مسح سجل الصفقات"):
+        st.session_state.trades = []
+        st.rerun()
 
 try:
     df_ltf = fetch_data(symbol, timeframe)
@@ -290,19 +263,42 @@ try:
     col4.metric("الحالة", "🟢 مباشر")
     
     df, active_zones = detect_zones(df_ltf)
-    render_tv_chart(df, active_zones, symbol, timeframe)
+    
+    # تحديث الصفقات بناءً على السعر الحالي
+    update_trades(current_price)
+    
+    render_plotly_chart(df, active_zones, symbol, timeframe)
     
     touched_zones = [z for z in active_zones if z['status'] == 'Touched']
     waiting_zones = [z for z in active_zones if z['status'] == 'Waiting']
     
     st.divider()
     
+    # عرض الصفقات النشطة (Trade Monitoring)
+    if st.session_state.trades:
+        st.subheader("📋 مراقبة الصفقات النشطة")
+        for t in st.session_state.trades:
+            status_color = "🟢" if "TP" in t['status'] or "Break" in t['status'] else ("🔴" if "SL" in t['status'] else "🔵")
+            st.markdown(f"{status_color} **{t['type']}** | الدخول: {t['entry']:.4f} | SL الحالي: {t['sl']:.4f} | الحالة: {t['status']}")
+            if t.get('sl_moved'):
+                st.caption("🛡️ تم نقل وقف الخسارة إلى نقطة التعادل (Break-even)")
+    
     if touched_zones:
-        st.subheader("🚨 إشارات نشطة")
+        st.subheader("🚨 إشارات جديدة (تم لمس المنطقة)")
         for z in touched_zones:
+            # منع التكرار في السجل
+            already_exists = any(t['time'] == z['time'] and t['type'] == z['type'] for t in st.session_state.trades)
+            if not already_exists:
+                new_trade = {
+                    'type': z['type'], 'time': z['time'], 'entry': z['entry'],
+                    'sl': z['sl'], 'tp1': z['tp1'], 'tp2': z['tp2'],
+                    'status': 'Active', 'pnl': '', 'sl_moved': False
+                }
+                st.session_state.trades.append(new_trade)
+            
             with st.container():
-                if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} - Zone Achat**")
-                else: st.error(f"🔴 **{z['type']} - Zone Vente**")
+                if z['type'] == 'BUY': st.success(f"🟢 **{z['type']} Signal - Zone Achat**")
+                else: st.error(f"🔴 **{z['type']} Signal - Zone Vente**")
                 
                 col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("💰 الدخول", f"{z['entry']:.4f}")
